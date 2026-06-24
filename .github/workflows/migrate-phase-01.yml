@@ -1,0 +1,98 @@
+name: Migrate Phase 01 — DB schema (source / correlation_id / entra_oid)
+
+# Aplica as migrations IDEMPOTENTES da Fase 1 (phase-01.sql + phase-03.sql) no
+# Azure SQL PRIVADO do workshop.
+#
+# Como o SQL fica com "Public Network Access = Disabled", um runner do GitHub
+# (internet pública) não o alcança. Este workflow, de forma reproduzível:
+#   1. liga o acesso público + abre firewall SÓ para o IP do runner;
+#   2. roda as migrations via azure/sql-action (sqlcmd — entende `GO`);
+#   3. REVERTE tudo (remove a regra + desliga o público) — inclusive em falha.
+#
+# É um passo PRÉ-WORKSHOP (rodar UMA vez por ambiente), separado do deploy de
+# código (deploy-phase-01.yml). As migrations são aditivas e idempotentes:
+# rodar de novo não causa efeito colateral.
+#
+# Pré-requisitos no fork (ver runbook docs/runbooks/aula1-f1-portal-guide-ambiente-hml-cin.md):
+#   - secret AZURE_CREDENTIALS      : Service Principal p/ az login (seção "Service Principal")
+#   - secret SQL_CONNECTION_STRING  : connection string do FIFA2026Tickets (User Id/Password)
+#   - var    PHASE01_SQL_SERVER     : nome do SQL server (sem sufixo) — default sql-dev-tk-cin-001
+#   - var    PHASE01_RESOURCE_GROUP : RG do SQL — default rg-hml-tik-cin-001
+
+on:
+  workflow_dispatch:
+    inputs:
+      sql_server:
+        description: 'SQL server name (override, sem .database.windows.net)'
+        required: false
+      resource_group:
+        description: 'Resource group do SQL (override)'
+        required: false
+
+env:
+  DEFAULT_SQL_SERVER: 'sql-dev-tk-cin-001'
+  DEFAULT_RESOURCE_GROUP: 'rg-hml-tik-cin-001'
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Resolver parâmetros + IP do runner
+        run: |
+          set -euo pipefail
+          # Precedência: input manual -> GitHub Variable (aluno) -> default.
+          SQL_SERVER="${{ github.event.inputs.sql_server || vars.PHASE01_SQL_SERVER || env.DEFAULT_SQL_SERVER }}"
+          RG="${{ github.event.inputs.resource_group || vars.PHASE01_RESOURCE_GROUP || env.DEFAULT_RESOURCE_GROUP }}"
+          RUNNER_IP="$(curl -fsS https://api.ipify.org)"
+          RULE_NAME="gh-migrate-${{ github.run_id }}"
+          {
+            echo "SQL_SERVER=$SQL_SERVER"
+            echo "RG=$RG"
+            echo "RUNNER_IP=$RUNNER_IP"
+            echo "RULE_NAME=$RULE_NAME"
+          } >> "$GITHUB_ENV"
+          echo "SQL: $SQL_SERVER | RG: $RG | runner IP: $RUNNER_IP | rule: $RULE_NAME"
+
+      - name: Abrir acesso temporário (público + firewall do runner)
+        run: |
+          set -euo pipefail
+          az sql server update -g "$RG" -n "$SQL_SERVER" --set publicNetworkAccess=Enabled -o none
+          az sql server firewall-rule create -g "$RG" -s "$SQL_SERVER" \
+            -n "$RULE_NAME" --start-ip-address "$RUNNER_IP" --end-ip-address "$RUNNER_IP" -o none
+          echo "Acesso público + firewall abertos para $RUNNER_IP (regra $RULE_NAME)."
+          sleep 10
+
+      - name: Migration phase-01 (source + correlation_id + UQ index)
+        uses: azure/sql-action@v2
+        with:
+          connection-string: ${{ secrets.SQL_CONNECTION_STRING }}
+          path: fifa2026-api/database/migrations/phase-01.sql
+
+      - name: Migration phase-03 (entra_oid + index)
+        uses: azure/sql-action@v2
+        with:
+          connection-string: ${{ secrets.SQL_CONNECTION_STRING }}
+          path: fifa2026-api/database/migrations/phase-03.sql
+
+      - name: Reverter acesso (sempre, mesmo em falha)
+        if: always()
+        run: |
+          set +e
+          if [ -n "${SQL_SERVER:-}" ] && [ -n "${RG:-}" ]; then
+            if [ -n "${RULE_NAME:-}" ]; then
+              az sql server firewall-rule delete -g "$RG" -s "$SQL_SERVER" -n "$RULE_NAME" -o none
+            fi
+            az sql server update -g "$RG" -n "$SQL_SERVER" --set publicNetworkAccess=Disabled -o none
+            echo "Acesso revertido: regra removida e Public Network Access = Disabled."
+          else
+            echo "Contexto incompleto (passo de resolução falhou) — nada a reverter."
+          fi
